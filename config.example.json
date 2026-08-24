@@ -1,0 +1,38 @@
+{
+    "sink": {
+        "kind": "bhaptics",
+        "app_id": "",
+        "api_key": "",
+        "motor_count": 32,
+        "front_gain": 1.0,
+        "back_gain": 1.0
+    },
+    "video_device_index": 0,
+    "video_width": 1280,
+    "video_height": 720,
+    "fps": 30,
+    "hp_roi": [
+        0.05,
+        0.65,
+        0.25,
+        0.12
+    ],
+    "min_damage_threshold": 3.0,
+    "hp_confirm_frames": 6,
+    "deadband_percent": 2.0,
+    "debounce_ms": 350,
+    "haptic_light_intensity": 40,
+    "haptic_light_duration": 180,
+    "haptic_medium_intensity": 70,
+    "haptic_medium_duration": 280,
+    "haptic_heavy_intensity": 90,
+    "haptic_heavy_duration": 450,
+    "haptic_critical_intensity": 100,
+    "haptic_critical_duration": 700,
+    "haptic_position": "VestFront",
+    "show_visual_overlay": true,
+    "show_floating_overlay": true,
+    "floating_overlay_x": 60,
+    "floating_overlay_y": 60,
+    "bhaptics_ws_url": "ws://127.0.0.1:15881/v2/feedbacks"
+}
