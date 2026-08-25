@@ -1,15 +1,13 @@
 import json
+import math
 import time
 import threading
 import queue
-import asyncio
-import numpy as np
-import websocket
 from typing import Callable, Optional, List, Dict, Any, Tuple
+import numpy as np
 
-from config import HapticSinkConfig
+from config import HapticSinkConfig, DetailedHapticConfig, HapticDetailRow
 
-# 공식 SDK 임포트
 try:
     import bhaptics_python
     HAS_BHAPTICS_SDK = True
@@ -18,11 +16,19 @@ except ImportError:
     HAS_BHAPTICS_SDK = False
 
 class HapticManager:
-    """공식 bhaptics-python SDK 및 레거시 WebSocket 기반 햅틱 컨트롤러 (실시간 모터 시각화 지원)"""
+    """
+    포챔스 전용 다이내믹 햅틱 컨트롤러
+    - 🎽 공식 bhaptics-python SDK 직접 제어
+    - ⚡ 4단계 피격 (경타/중타/강타/치명타) + 기절 + 심장박동 + 빨피 상시
+    - 🔢 멀티 버스트 타격횟수(Hit Count) 지원
+    - 🎚️ 앞/뒤 균형 및 마스터 세기 실시간 적용
+    - 📊 실시간 2D 모터 매트릭스 시각화
+    """
 
-    def __init__(self, sink_config: HapticSinkConfig, ws_url: str = "ws://127.0.0.1:15881/v2/feedbacks"):
+    def __init__(self, sink_config: HapticSinkConfig, details_config: Optional[DetailedHapticConfig] = None):
         self.sink = sink_config
-        self.ws_url = ws_url
+        self.details = details_config if details_config is not None else DetailedHapticConfig()
+        self.master_intensity: int = 100
         
         self._is_running = False
         self._connected = False
@@ -31,10 +37,6 @@ class HapticManager:
         # 큐 및 스레드
         self._send_queue: queue.Queue = queue.Queue(maxsize=100)
         self._worker_thread: Optional[threading.Thread] = None
-        self._async_loop: Optional[asyncio.AbstractEventLoop] = None
-        
-        # WebSocket 레거시용
-        self.ws: Optional[websocket.WebSocketApp] = None
         
         # 실시간 모터 상태 추적 (시각화 애니메이션용)
         self.last_front_motors: List[int] = [0] * 20
@@ -44,7 +46,7 @@ class HapticManager:
         self.last_level: str = "none"
         self._state_lock = threading.Lock()
         
-        # 콜백: (level, intensity, duration_ms, front_motors, back_motors)
+        # 콜백
         self.on_status_change: Optional[Callable[[bool, str], None]] = None
         self.on_haptic_trigger: Optional[Callable[[str, int, int, List[int], List[int]], None]] = None
 
@@ -54,7 +56,7 @@ class HapticManager:
             return
             
         self._is_running = True
-        self._worker_thread = threading.Thread(target=self._run_backend, daemon=True)
+        self._worker_thread = threading.Thread(target=self._run_official_sdk, daemon=True)
         self._worker_thread.start()
 
     def stop(self) -> None:
@@ -62,18 +64,10 @@ class HapticManager:
         self._is_running = False
         self._connected = False
         
-        # 공식 SDK 정리
-        if self.sink.kind == "bhaptics" and HAS_BHAPTICS_SDK:
+        if HAS_BHAPTICS_SDK:
             try:
                 bhaptics_python.stop_all()
                 bhaptics_python.close()
-            except Exception:
-                pass
-                
-        # WebSocket 정리
-        if self.ws:
-            try:
-                self.ws.close()
             except Exception:
                 pass
                 
@@ -98,297 +92,193 @@ class HapticManager:
             except Exception as e:
                 print(f"[Haptics] 상태 콜백 오류: {e}")
 
-    def _run_backend(self) -> None:
-        """선택된 방식(SDK 또는 WebSocket)에 따라 백엔드 루프 실행"""
-        if self.sink.kind == "bhaptics":
-            self._run_sdk_backend()
-        else:
-            self._run_websocket_backend()
-
-    # ==========================================
-    # 1. 공식 bhaptics-python SDK 백엔드
-    # ==========================================
-    def _run_sdk_backend(self) -> None:
-        """공식 SDK asyncio 워커 루프"""
+    def _run_official_sdk(self) -> None:
+        """공식 bhaptics-python SDK 백엔드"""
         if not HAS_BHAPTICS_SDK:
-            self._notify_status(False, "오류: bhaptics-python 패키지가 설치되지 않았습니다.")
+            self._notify_status(False, "bhaptics-python 패키지가 설치되지 않았습니다.")
             return
 
-        if not self.sink.app_id.strip() or not self.sink.api_key.strip():
-            self._notify_status(False, "App ID / API Key를 입력하고 설정을 저장하세요.")
-            print("[Haptics] App ID 또는 API Key가 비어 있어 SDK 초기화를 대기합니다.")
-            
-        self._async_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._async_loop)
-        
-        try:
-            self._async_loop.run_until_complete(self._sdk_main_loop())
-        except Exception as e:
-            self._notify_status(False, f"SDK 루프 오류: {e}")
-        finally:
-            self._async_loop.close()
-
-    async def _sdk_main_loop(self) -> None:
-        """SDK 초기화 및 큐 전송 비동기 루프"""
         app_id = self.sink.app_id.strip()
         api_key = self.sink.api_key.strip()
         
         if not app_id or not api_key:
-            while self._is_running:
-                await asyncio.sleep(1.0)
+            self._notify_status(False, "App ID 또는 API Key를 입력해주세요.")
             return
 
         try:
             self._notify_status(False, "bHaptics SDK 초기화 중...")
-            await bhaptics_python.registry_and_initialize(app_id, api_key, "")
-            self._notify_status(True, f"bHaptics SDK 연결됨 ({self.sink.motor_count} 모터)")
-            print(f"[Haptics] 공식 bhaptics-python SDK 초기화 완료! (App ID: {app_id})")
+            bhaptics_python.init(app_id, api_key)
+            self._notify_status(True, "bHaptics SDK 공식 연결 완료")
+            print("[Haptics] bhaptics_python 공식 SDK 초기화 성공")
         except Exception as e:
             self._notify_status(False, f"SDK 초기화 실패: {e}")
-            print(f"[Haptics] SDK 초기화 실패: {e}")
+            return
 
-        # 모터 출력 루프
         while self._is_running:
-            try:
-                while not self._send_queue.empty():
-                    item = self._send_queue.get_nowait()
-                    if item.get("type") == "play_dot":
-                        duration = item["duration"]
-                        motors = item["motors"]
-                        bhaptics_python.play_dot(0, duration, motors)
-                await asyncio.sleep(0.01)
-            except Exception:
-                await asyncio.sleep(0.05)
-
-    # ==========================================
-    # 2. 레거시 WebSocket 백엔드
-    # ==========================================
-    def _run_websocket_backend(self) -> None:
-        """bHaptics Player 로컬 WebSocket 서버 통신 워커"""
-        print(f"[Haptics] 레거시 WebSocket 모드로 {self.ws_url} 연결 시도...")
-        while self._is_running:
-            try:
-                self.ws = websocket.WebSocketApp(
-                    self.ws_url,
-                    on_open=self._on_ws_open,
-                    on_message=self._on_ws_message,
-                    on_error=self._on_ws_error,
-                    on_close=self._on_ws_close
-                )
-                
-                ws_sender_thread = threading.Thread(target=self._ws_queue_sender, daemon=True)
-                ws_sender_thread.start()
-                
-                self.ws.run_forever(ping_interval=5, ping_timeout=2)
-            except Exception as e:
-                self._notify_status(False, f"WebSocket 재연결 대기: {e}")
-            
-            if self._is_running:
-                time.sleep(3)
-
-    def _ws_queue_sender(self) -> None:
-        """WebSocket 전송 큐 처리"""
-        while self._is_running and self._connected:
             try:
                 item = self._send_queue.get(timeout=0.1)
-                if item.get("type") == "ws_msg" and self.ws and self.ws.sock and self.ws.sock.connected:
-                    self.ws.send(json.dumps(item["payload"]))
             except queue.Empty:
                 continue
+
+            try:
+                req_type = item.get("type")
+                if req_type == "play_dot":
+                    duration = item.get("duration", 200)
+                    motors = item.get("motors", [])
+                    bhaptics_python.play_dot(duration, motors)
+                elif req_type == "stop":
+                    bhaptics_python.stop_all()
             except Exception as e:
-                print(f"[Haptics] WebSocket 메시지 송신 오류: {e}")
+                print(f"[Haptics] SDK 전송 오류: {e}")
 
-    def _on_ws_open(self, ws):
-        print(f"[Haptics] bHaptics Player WebSocket 연결 성공 ({self.ws_url})")
-        self._notify_status(True, "bHaptics Player 연결됨 (WebSocket)")
-        register_msg = {
-            "Register": [{
-                "Key": "PochamsHaptics",
-                "Project": {
-                    "Tracks": [],
-                    "Layout": {"Type": "Vest"}
-                }
-            }]
-        }
-        ws.send(json.dumps(register_msg))
-
-    def _on_ws_message(self, ws, message):
-        pass
-
-    def _on_ws_error(self, ws, error):
-        print(f"[Haptics] WebSocket 에러: {error}")
-        self._notify_status(False, f"bHaptics 연결 에러: {error}")
-
-    def _on_ws_close(self, ws, close_status_code, close_msg):
-        print(f"[Haptics] WebSocket 연결 끊김: {close_status_code} - {close_msg}")
-        self._notify_status(False, "bHaptics 연결 끊김 (재연결 중...)")
-
-    # ==========================================
-    # 3. 모터 매핑 및 햅틱 출력
-    # ==========================================
     def _create_sdk_motor_array(self, front_20: List[int], back_20: List[int]) -> List[int]:
-        """
-        공식 SDK 포맷(정수 0~100 배열)으로 변환
-        32모터: 16전면 + 16후면
-        40모터: 20전면 + 20후면
-        """
-        f_gain = self.sink.front_gain
-        b_gain = self.sink.back_gain
+        """Vest 32점 또는 40점 매핑"""
+        # 마스터 세기 및 앞뒤 밸런스 적용
+        m_factor = self.master_intensity / 100.0
+        fb_factor = (self.details.front_balance / 100.0) * self.sink.front_gain
+        bb_factor = (self.details.back_balance / 100.0) * self.sink.back_gain
+        
+        f20_g = [int(np.clip(v * fb_factor * m_factor, 0, 100)) for v in front_20]
+        b20_g = [int(np.clip(v * bb_factor * m_factor, 0, 100)) for v in back_20]
 
         if self.sink.motor_count == 32:
-            # 20 -> 16 모터 다운샘플링 (4x5 그리드 중 가슴/복부 4x4 핵심 모터 추출)
-            f16_indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-            b16_indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-            
-            f16 = [int(np.clip(front_20[i] * f_gain, 0, 100)) for i in f16_indices]
-            b16 = [int(np.clip(back_20[i] * b_gain, 0, 100)) for i in b16_indices]
+            indices_16 = [0, 1, 2, 3, 4, 7, 8, 11, 12, 15, 16, 17, 18, 19, 5, 6]
+            f16 = [f20_g[i] for i in indices_16]
+            b16 = [b20_g[i] for i in indices_16]
             return f16 + b16
         else:
-            # 40 모터 (전면 20 + 후면 20)
-            f20_g = [int(np.clip(v * f_gain, 0, 100)) for v in front_20]
-            b20_g = [int(np.clip(v * b_gain, 0, 100)) for v in back_20]
             return f20_g + b20_g
 
-    def trigger_damage(self, level: str, damage_delta: float = 0.0, position_mode: str = "VestFront") -> None:
-        """
-        데미지 수준별 햅틱 피드백 전송
-        level: "light", "medium", "heavy", "critical"
-        """
-        front_20 = [0] * 20
-        back_20 = [0] * 20
-        duration_ms = 200
-        intensity = 50
+    def trigger_pattern_direct(self, level: str, detail_row: HapticDetailRow, position_mode: Optional[str] = None) -> None:
+        """단일 또는 다중 타격횟수(Hit Count) 패턴 비동기 실행 (부위별 설정 지원)"""
+        pos = position_mode if position_mode is not None else getattr(detail_row, "position", "All")
+        threading.Thread(target=self._exec_pattern_burst, args=(level, detail_row, pos), daemon=True).start()
 
-        if level == "light":
-            # 약공격: 가슴 중앙 4개 모터 집중
-            intensity = 40
-            duration_ms = 180
-            for idx in [5, 6, 9, 10]:
-                front_20[idx] = intensity
+    def _exec_pattern_burst(self, level: str, detail_row: HapticDetailRow, position_mode: str = "All") -> None:
+        """타격 횟수(Hit Count)만큼 반복해서 진동 버스트 전송"""
+        hit_count = max(1, min(5, detail_row.hit_count))
+        duration_ms = int(detail_row.duration * 1000)
+        intensity_val = int(detail_row.intensity)
 
-        elif level == "medium":
-            # 중공격: 가슴 + 명치 + 상복부
-            intensity = 70
-            duration_ms = 280
-            for idx in [4, 5, 6, 7, 8, 9, 10, 11, 13, 14]:
-                front_20[idx] = intensity
-            if position_mode == "All":
-                for idx in [5, 6, 9, 10]:
-                    back_20[idx] = int(intensity * 0.5)
+        for burst_idx in range(hit_count):
+            front_20, back_20 = self._generate_motor_matrix(level, intensity_val, position_mode)
+            motors_sdk = self._create_sdk_motor_array(front_20, back_20)
 
-        elif level == "heavy":
-            # 강공격: 앞면 전체 20개 모터 + 등 잔류 진동
-            intensity = 90
-            duration_ms = 450
-            front_20 = [intensity] * 20
-            if position_mode in ["VestBack", "All"]:
-                for idx in [4, 5, 6, 7, 8, 9, 10, 11]:
-                    back_20[idx] = int(intensity * 0.7)
+            # 실시간 시각화 상태 기록
+            with self._state_lock:
+                self.last_front_motors = front_20
+                self.last_back_motors = back_20
+                self.last_trigger_time = time.time()
+                self.last_duration_ms = duration_ms
+                self.last_level = level
 
-        elif level == "critical":
-            # 치명타 / KO: 전신 100% 최대 파동
-            intensity = 100
-            duration_ms = 700
-            front_20 = [100] * 20
-            back_20 = [100] * 20
-
-        # 위치 모드 단독 후면 반전
-        if position_mode == "VestBack" and sum(back_20) == 0:
-            back_20 = front_20
-            front_20 = [0] * 20
-
-        # 실시간 모터 상태 기록 (UI 시각화용)
-        with self._state_lock:
-            self.last_front_motors = front_20.copy()
-            self.last_back_motors = back_20.copy()
-            self.last_trigger_time = time.time()
-            self.last_duration_ms = duration_ms
-            self.last_level = level
-
-        # 1. 공식 SDK 방식 전송
-        if self.sink.kind == "bhaptics":
-            motors = self._create_sdk_motor_array(front_20, back_20)
+            # 하드웨어 SDK 전송
             try:
                 self._send_queue.put_nowait({
                     "type": "play_dot",
                     "duration": duration_ms,
-                    "motors": motors
-                })
-            except queue.Full:
-                pass
-                
-        # 2. 레거시 WebSocket 방식 전송
-        else:
-            front_dots = [{"Index": i, "Intensity": int(np.clip(v * self.sink.front_gain, 0, 100))} for i, v in enumerate(front_20) if v > 0]
-            back_dots = [{"Index": i, "Intensity": int(np.clip(v * self.sink.back_gain, 0, 100))} for i, v in enumerate(back_20) if v > 0]
-            
-            payload = {"Submit": []}
-            if front_dots:
-                payload["Submit"].append({
-                    "Type": "dot",
-                    "Key": f"Pochams_{level}_Front",
-                    "Frame": {
-                        "Position": "VestFront",
-                        "DotPoints": front_dots,
-                        "DurationMillis": duration_ms
-                    }
-                })
-            if back_dots:
-                payload["Submit"].append({
-                    "Type": "dot",
-                    "Key": f"Pochams_{level}_Back",
-                    "Frame": {
-                        "Position": "VestBack",
-                        "DotPoints": back_dots,
-                        "DurationMillis": duration_ms
-                    }
-                })
-            try:
-                self._send_queue.put_nowait({
-                    "type": "ws_msg",
-                    "payload": payload
+                    "motors": motors_sdk
                 })
             except queue.Full:
                 pass
 
-        if self.on_haptic_trigger:
-            try:
-                self.on_haptic_trigger(level, intensity, duration_ms, front_20, back_20)
-            except Exception as e:
-                print(f"[Haptics] 트리거 콜백 오류: {e}")
+            if self.on_haptic_trigger:
+                try:
+                    self.on_haptic_trigger(level, intensity_val, duration_ms, front_20, back_20)
+                except Exception:
+                    pass
+
+            if burst_idx < hit_count - 1:
+                time.sleep((detail_row.duration * 0.7) + 0.05)
+
+    def trigger_damage_haptic(self, damage_percent: float, current_hp_pct: float = 100.0, position_mode: Optional[str] = None) -> None:
+        """감지된 데미지 % 및 남은 체력 %에 따른 햅틱 패턴 자동 분기 (각 행별 부위 적용)"""
+        d = self.details
+        if current_hp_pct <= 0.0:
+            pos = position_mode if position_mode is not None else d.faint.position
+            self.trigger_pattern_direct("faint", d.faint, pos)
+        elif damage_percent <= 20.0:
+            pos = position_mode if position_mode is not None else d.light.position
+            self.trigger_pattern_direct("light", d.light, pos)
+        elif damage_percent <= 50.0:
+            pos = position_mode if position_mode is not None else d.medium.position
+            self.trigger_pattern_direct("medium", d.medium, pos)
+        elif damage_percent <= 80.0:
+            pos = position_mode if position_mode is not None else d.heavy.position
+            self.trigger_pattern_direct("heavy", d.heavy, pos)
+        else:
+            pos = position_mode if position_mode is not None else d.critical.position
+            self.trigger_pattern_direct("critical", d.critical, pos)
+
+    def _generate_motor_matrix(self, level: str, intensity: int, position_mode: str = "All") -> Tuple[List[int], List[int]]:
+        """패턴 레벨에 따른 20개 모터 강도 매핑"""
+        front = [0] * 20
+        back = [0] * 20
+        
+        use_front = position_mode in ["VestFront", "All"]
+        use_back = position_mode in ["VestBack", "All"]
+
+        if level == "light":
+            # 경타: 가슴 중앙 2개 모터
+            indices = [5, 6]
+            for idx in indices:
+                if use_front: front[idx] = intensity
+                if use_back: back[idx] = intensity
+
+        elif level == "medium":
+            # 중타: 상체 및 가슴 6개 모터
+            indices = [1, 2, 5, 6, 9, 10]
+            for idx in indices:
+                if use_front: front[idx] = intensity
+                if use_back: back[idx] = intensity
+
+        elif level == "heavy":
+            # 강타: 가슴, 복부, 옆구리 12개 모터
+            indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+            for idx in indices:
+                if use_front: front[idx] = intensity
+                if use_back: back[idx] = intensity
+
+        elif level in ["critical", "faint"]:
+            # 치명타 / 기절: 20개 전 모터 풀 파워
+            for idx in range(20):
+                if use_front: front[idx] = intensity
+                if use_back: back[idx] = intensity
+
+        elif level == "heartbeat":
+            # 심장박동: 좌측 가슴 펄스
+            indices = [4, 5, 8]
+            for idx in indices:
+                if use_front: front[idx] = intensity
+                if use_back: back[idx] = int(intensity * 0.5)
+
+        elif level == "low_hp_loop":
+            # 빨피 상시: 하복부 은은한 베이스 지속 진동
+            indices = [12, 13, 14, 15, 16, 17, 18, 19]
+            for idx in indices:
+                if use_front: front[idx] = intensity
+                if use_back: back[idx] = intensity
+        else:
+            indices = [5, 6]
+            for idx in indices:
+                if use_front: front[idx] = intensity
+                if use_back: back[idx] = intensity
+
+        return front, back
 
     def get_current_motor_intensities(self) -> Tuple[List[float], List[float], str]:
-        """UI 시각화를 위한 현재 감쇠된 40개 모터 실시간 강도(0~100) 및 레벨 반환"""
+        """UI 시각화를 위해 현재 활성화된 모터 강도(0~100)와 패턴 레벨 반환"""
         with self._state_lock:
-            if self.last_trigger_time <= 0:
-                return [0.0] * 20, [0.0] * 20, "none"
+            elapsed = (time.time() - self.last_trigger_time) * 1000.0
+            duration = max(50, self.last_duration_ms)
             
-            elapsed_ms = (time.time() - self.last_trigger_time) * 1000.0
-            total_duration = float(self.last_duration_ms + 400)
-            
-            if elapsed_ms >= total_duration:
+            if elapsed >= duration or self.last_level == "none":
                 return [0.0] * 20, [0.0] * 20, "none"
-                
-            decay = max(0.0, 1.0 - (elapsed_ms / total_duration))
-            front = [v * decay for v in self.last_front_motors]
-            back = [v * decay for v in self.last_back_motors]
-            return front, back, self.last_level
 
-    def stop_all(self) -> None:
-        """모든 햅틱 진동 정지"""
-        with self._state_lock:
-            self.last_front_motors = [0] * 20
-            self.last_back_motors = [0] * 20
-            self.last_trigger_time = 0.0
+            # 감쇠 페이드아웃 곡선
+            ratio = 1.0 - (elapsed / duration)
+            fade = math.sin(ratio * math.pi / 2.0)
             
-        if self.sink.kind == "bhaptics" and HAS_BHAPTICS_SDK:
-            try:
-                bhaptics_python.stop_all()
-            except Exception:
-                pass
-        else:
-            payload = {"Submit": [{"Type": "turnOff", "Key": "all"}]}
-            try:
-                self._send_queue.put_nowait({"type": "ws_msg", "payload": payload})
-            except Exception:
-                pass
+            front_f = [float(v * fade) for v in self.last_front_motors]
+            back_f = [float(v * fade) for v in self.last_back_motors]
+            return front_f, back_f, self.last_level
