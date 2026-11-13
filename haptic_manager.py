@@ -37,6 +37,8 @@ class HapticManager:
         # 큐 및 스레드
         self._send_queue: queue.Queue = queue.Queue(maxsize=100)
         self._worker_thread: Optional[threading.Thread] = None
+        self._burst_queue: queue.Queue = queue.Queue(maxsize=32)
+        self._burst_worker_thread: Optional[threading.Thread] = None
         
         # 실시간 모터 상태 추적 (시각화 애니메이션용)
         self.last_front_motors: List[int] = [0] * 20
@@ -58,6 +60,10 @@ class HapticManager:
         self._is_running = True
         self._worker_thread = threading.Thread(target=self._run_official_sdk, daemon=True)
         self._worker_thread.start()
+        
+        # 🚀 전용 버스트 워커 가동 (스레드 무한 생성 오버헤드 제거)
+        self._burst_worker_thread = threading.Thread(target=self._run_burst_worker, daemon=True)
+        self._burst_worker_thread.start()
 
     def stop(self) -> None:
         """햅틱 매니저 정지 및 리소스 정리"""
@@ -150,33 +156,159 @@ class HapticManager:
             return f20_g + b20_g
 
     def trigger_pattern_direct(self, level: str, detail_row: HapticDetailRow, position_mode: Optional[str] = None) -> None:
-        """단일 또는 다중 타격횟수(Hit Count) 패턴 비동기 실행 (부위별 설정 지원)"""
+        """단일 또는 다중 타격횟수(Hit Count) 패턴 비동기 실행 (연속기 밀림 방지를 위한 최신 타격 우선 선점)"""
         pos = position_mode if position_mode is not None else getattr(detail_row, "position", "All")
-        threading.Thread(target=self._exec_pattern_burst, args=(level, detail_row, pos), daemon=True).start()
+        # 실제 피격(경타~기절)이 발생한 경우 대기열에 밀려 있는 이전 루프/잔여 진동을 비워 즉각 반응 보장
+        if level in ["light", "medium", "heavy", "critical", "faint"]:
+            while not self._burst_queue.empty():
+                try:
+                    self._burst_queue.get_nowait()
+                except queue.Empty:
+                    break
+        try:
+            self._burst_queue.put_nowait((level, detail_row, pos))
+        except queue.Full:
+            pass
+
+    def _run_burst_worker(self) -> None:
+        """백그라운드 전용 버스트 워커 루프"""
+        while self._is_running:
+            try:
+                item = self._burst_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            level, detail_row, pos = item
+            self._exec_pattern_burst(level, detail_row, pos)
 
     def _exec_pattern_burst(self, level: str, detail_row: HapticDetailRow, position_mode: str = "All") -> None:
-        """타격 횟수(Hit Count)만큼 반복해서 진동 버스트 전송"""
+        """타격 횟수(Hit Count)만큼 반복해서 진동 버스트 전송 (충격파 분산 모드 지원)"""
         hit_count = max(1, min(5, detail_row.hit_count))
         duration_ms = int(detail_row.duration * 1000)
         intensity_val = int(detail_row.intensity)
+        use_ripple = getattr(self.details, "enable_ripple_effect", True) and (level in ["medium", "heavy", "critical"])
 
         for burst_idx in range(hit_count):
-            front_20, back_20 = self._generate_motor_matrix(level, intensity_val, position_mode)
-            motors_sdk = self._create_sdk_motor_array(front_20, back_20)
+            if use_ripple:
+                self._exec_ripple_burst(level, intensity_val, duration_ms, position_mode)
+            else:
+                front_20, back_20 = self._generate_motor_matrix(level, intensity_val, position_mode)
+                motors_sdk = self._create_sdk_motor_array(front_20, back_20)
 
-            # 실시간 시각화 상태 기록
+                # 실시간 시각화 상태 기록
+                with self._state_lock:
+                    self.last_front_motors = front_20
+                    self.last_back_motors = back_20
+                    self.last_trigger_time = time.time()
+                    self.last_duration_ms = duration_ms
+                    self.last_level = level
+
+                # 하드웨어 SDK 전송
+                try:
+                    self._send_queue.put_nowait({
+                        "type": "play_dot",
+                        "duration": duration_ms,
+                        "motors": motors_sdk
+                    })
+                except queue.Full:
+                    pass
+
+                if self.on_haptic_trigger:
+                    try:
+                        self.on_haptic_trigger(level, intensity_val, duration_ms, front_20, back_20)
+                    except Exception:
+                        pass
+
+            if burst_idx < hit_count - 1:
+                # 대기 중 새 타격(연속기 후속타 또는 기절)이 큐에 들어오면 잔여 반복을 즉시 중단하고 새 타격에 양보
+                if not self._burst_queue.empty():
+                    break
+                time.sleep((detail_row.duration * 0.7) + 0.05)
+                if not self._burst_queue.empty():
+                    break
+
+    def _exec_ripple_burst(self, level: str, intensity: int, duration_ms: int, position_mode: str = "All") -> None:
+        """🌊 입체 파동형 충격파(Ripple Shockwave) 햅틱: 코어 타격 후 외곽 및 등 뒤로 확산"""
+        phases = []
+        use_front = position_mode in ["VestFront", "All"]
+        use_back = position_mode in ["VestBack", "All"]
+
+        if level == "medium":
+            # 중타 (2단계): 가슴 중앙 -> 주변 링 확산
+            p1_front = [0] * 20
+            p1_back = [0] * 20
+            if use_front: p1_front[5] = p1_front[6] = intensity
+            if use_back: p1_back[5] = p1_back[6] = int(intensity * 0.5)
+            phases.append((p1_front, p1_back, 80, 0.05))
+
+            p2_front = [0] * 20
+            p2_back = [0] * 20
+            ring = [1, 2, 9, 10]
+            for idx in ring:
+                if use_front: p2_front[idx] = int(intensity * 0.85)
+                if use_back: p2_back[idx] = int(intensity * 0.70)
+            rem_dur = max(100, duration_ms - 80)
+            phases.append((p2_front, p2_back, rem_dur, 0.0))
+
+        elif level == "heavy":
+            # 강타 (3단계): 코어 직격 -> 어깨/옆구리 확산 -> 등 뒤 관통
+            p1_front = [0] * 20
+            p1_back = [0] * 20
+            core = [5, 6, 9, 10]
+            for idx in core:
+                if use_front: p1_front[idx] = intensity
+            phases.append((p1_front, p1_back, 80, 0.045))
+
+            p2_front = [0] * 20
+            p2_back = [0] * 20
+            outer = [0, 1, 2, 3, 4, 7, 8, 11]
+            for idx in outer:
+                if use_front: p2_front[idx] = int(intensity * 0.90)
+            phases.append((p2_front, p2_back, 90, 0.045))
+
+            p3_front = [0] * 20
+            p3_back = [0] * 20
+            for idx in core:
+                if use_back: p3_back[idx] = int(intensity * 0.80)
+            rem_dur = max(120, duration_ms - 170)
+            phases.append((p3_front, p3_back, rem_dur, 0.0))
+
+        elif level == "critical":
+            # 치명타 (4단계): 전면 폭발 -> 전신 방사 -> 후면 관통 폭풍 -> 저주파 여운
+            p1_front = [0] * 20
+            p1_back = [0] * 20
+            for idx in [5, 6, 9, 10]:
+                if use_front: p1_front[idx] = intensity
+            phases.append((p1_front, p1_back, 70, 0.04))
+
+            p2_front = [intensity if use_front else 0] * 20
+            p2_back = [0] * 20
+            phases.append((p2_front, p2_back, 100, 0.04))
+
+            p3_front = [int(intensity * 0.5) if use_front else 0] * 20
+            p3_back = [int(intensity * 0.95) if use_back else 0] * 20
+            phases.append((p3_front, p3_back, 120, 0.05))
+
+            p4_front = [0] * 20
+            p4_back = [0] * 20
+            for idx in range(12, 20):
+                if use_front: p4_front[idx] = int(intensity * 0.45)
+                if use_back: p4_back[idx] = int(intensity * 0.45)
+            rem_dur = max(150, duration_ms - 290)
+            phases.append((p4_front, p4_back, rem_dur, 0.0))
+
+        for f20, b20, phase_dur, sleep_after in phases:
+            motors_sdk = self._create_sdk_motor_array(f20, b20)
             with self._state_lock:
-                self.last_front_motors = front_20
-                self.last_back_motors = back_20
+                self.last_front_motors = f20
+                self.last_back_motors = b20
                 self.last_trigger_time = time.time()
-                self.last_duration_ms = duration_ms
+                self.last_duration_ms = phase_dur
                 self.last_level = level
 
-            # 하드웨어 SDK 전송
             try:
                 self._send_queue.put_nowait({
                     "type": "play_dot",
-                    "duration": duration_ms,
+                    "duration": phase_dur,
                     "motors": motors_sdk
                 })
             except queue.Full:
@@ -184,12 +316,12 @@ class HapticManager:
 
             if self.on_haptic_trigger:
                 try:
-                    self.on_haptic_trigger(level, intensity_val, duration_ms, front_20, back_20)
+                    self.on_haptic_trigger(level, intensity, phase_dur, f20, b20)
                 except Exception:
                     pass
 
-            if burst_idx < hit_count - 1:
-                time.sleep((detail_row.duration * 0.7) + 0.05)
+            if sleep_after > 0:
+                time.sleep(sleep_after)
 
     def trigger_damage_haptic(self, damage_percent: float, current_hp_pct: float = 100.0, position_mode: Optional[str] = None) -> None:
         """감지된 데미지 % 및 남은 체력 %에 따른 햅틱 패턴 자동 분기 (각 행별 부위 적용)"""

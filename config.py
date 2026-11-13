@@ -40,6 +40,8 @@ class DetailedHapticConfig:
     # 8. 앞뒤 균형 (앞면 / 뒷면 세기 %)
     front_balance: int = 100
     back_balance: int = 100
+    # 9. 🌊 충격파(Ripple) 분산 효과 활성화 여부
+    enable_ripple_effect: bool = True
 
 @dataclass
 class AppConfig:
@@ -56,10 +58,11 @@ class AppConfig:
     video_height: int = 720
     fps: int = 30
     
-    # 아군 HP 바 ROI (정규화 좌표: 0.0 ~ 1.0)
-    hp_roi: list[float] = field(default_factory=lambda: [0.05, 0.65, 0.25, 0.12])
+    # 아군 HP 바 ROI (정규화 좌표: 0.0 ~ 1.0 - 포챔스 배틀 체력 카드에 정확히 맞춤)
+    hp_roi: list[float] = field(default_factory=lambda: [0.045, 0.828, 0.195, 0.148])
     
     # 비전 감지 설정
+    detection_mode: str = "balanced"        # 감지 모드 ("fast": 초고속, "balanced": 균형 6:4, "accurate": 고정밀 8.5:1.5)
     min_damage_threshold: float = 3.0       # 최소 데미지 감지 기준 (% 단위)
     hp_confirm_frames: int = 3
     deadband_percent: float = 2.0
@@ -79,8 +82,10 @@ class AppConfig:
     overlay_show_front: bool = True         # 정면 오버레이 표시 여부
     overlay_show_back: bool = True          # 후면 오버레이 표시 여부
     
-    # UI 접힘 상태
+    # UI 접힘 및 컴팩트 모드 위치 상태
     sdk_settings_collapsed: bool = True
+    compact_mode_x: int = 180
+    compact_mode_y: int = 36
     
     # 로그 설정 (폰트 크기 및 필터)
     log_font_size: int = 11                 # 로그 글자 크기 (9 ~ 20 pt)
@@ -133,6 +138,8 @@ class AppConfig:
                 rows["front_balance"] = details_data["front_balance"]
             if "back_balance" in details_data:
                 rows["back_balance"] = details_data["back_balance"]
+            if "enable_ripple_effect" in details_data:
+                rows["enable_ripple_effect"] = bool(details_data["enable_ripple_effect"])
             haptic_details = DetailedHapticConfig(**rows)
             
             valid_fields = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
