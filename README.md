@@ -1,7 +1,7 @@
-# PokéChamps x bHaptics Tactile Link v3.0 (포챔스 x bHaptics 실시간 연동 시스템)
+# PokéChamps x bHaptics Tactile Link v3.1 (포챔스 x bHaptics 실시간 연동 시스템)
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v3.0.0-a3e635?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/Version-v3.1.0-a3e635?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Platform-Nintendo%20Switch-E60012?style=for-the-badge&logo=nintendoswitch&logoColor=white" />
   <img src="https://img.shields.io/badge/bHaptics-TactSuit%20X40%20%2F%20X16-22d3ee?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" />
@@ -83,7 +83,7 @@
 ## 🚀 설치 및 빠른 시작 (Quick Start)
 
 ### 방법 1: 독립 실행 파일(.exe)로 즉시 실행하기 (가장 추천 ⭐)
-1. [GitHub Releases](https://github.com/ManofKimchi08/pochams-bhaptics/releases)에서 최신 릴리즈 압축 파일(`Pochams_bHaptics_v3.0.0_Windows.zip`)을 다운로드하고 압축을 해제합니다.
+1. [GitHub Releases](https://github.com/ManofKimchi08/pochams-bhaptics/releases)에서 최신 릴리즈 압축 파일(`Pochams_bHaptics_v3.1.0_Windows.zip`)을 다운로드하고 압축을 해제합니다.
 2. 폴더 내 `Pochams_bHaptics.exe`를 실행합니다.
 
 ### 방법 2: Python 소스 코드로 직접 실행하기

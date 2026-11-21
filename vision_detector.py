@@ -22,13 +22,12 @@ RE_DIGITS = re.compile(r'\d+')
 
 class VisionDetector:
     """
-    포챔스 전용 슈퍼 안정화 5대 비전/OCR 엔진
-    - 🔍 1. 화이트 폰트 샤프닝 & CLAHE 적응형 명암비 전처리 (Unsharp Masking)
-    - 🔤 2. 포챔스 전용 숫자/슬래시 문법 검증기 & 오인식 교정기 (Regex & Char Normalization)
-    - 📊 3. 1D 색상 게이지 스캔라인 + 2D OCR 듀얼 교차 검증 (Dual Cross-Check)
-    - 🛡️ 4. 2~3프레임 연속 일치 다수결 합의 락 (Temporal Consensus Filter)
-    - ⏱️ 5. 포켓몬 교체 / 컷신 / 체력 회복 스마트 뮤트 (Smart Context Gate)
-    - 🎯 6. HUD 원클릭 자동 스냅 (Auto-Snap Card ROI)
+    포챔스 전용 100% 순수 숫자 OCR 비전 엔진
+    - 🔍 1. 3.0x 바이큐빅 확대 + Unsharp Mask + CLAHE / 화이트 마스크 / Otsu 3단 전처리
+    - 🔤 2. 포챔스 전용 숫자/슬래시 문법 검증기 & 한 자리 딸피('9197', '91197')/타이머 방어기
+    - 🛡️ 3. 감지 프로필별 합의 락 (초고속/균형 1프레임, 고정밀/교체보호 2프레임) & 리셋 세대(epoch) 격리
+    - ⏱️ 4. 포켓몬 교체 / 컷신 동결(Cutscene Hold) / 기절(0%) / 회복 상태 머신
+    - 🎯 5. HUD 원클릭 자동 스냅 (Auto-Snap Card ROI) & 실시간 실측 FPS 계산
     """
 
     def __init__(self,
@@ -37,8 +36,6 @@ class VisionDetector:
                  height: int = 720,
                  roi: List[float] = None,
                  min_damage_threshold: float = 3.0,
-                 buffer_size: int = 4,
-                 max_jitter_percent: float = 2.0,
                  **kwargs):
         
         self.device_index = device_index
@@ -46,7 +43,7 @@ class VisionDetector:
         self.target_height = height
         
         # ROI: [x_ratio, y_ratio, w_ratio, h_ratio] (0.0 ~ 1.0) - 포챔스 표준 배틀 체력 카드 영역
-        self.roi = roi if roi is not None else kwargs.get("initial_roi", [0.045, 0.828, 0.195, 0.148])
+        self.roi = list(roi) if roi is not None else list(kwargs.get("initial_roi", [0.045, 0.828, 0.195, 0.148]))
         self.min_damage_threshold = min_damage_threshold
         
         self._cap: Optional[cv2.VideoCapture] = None
@@ -63,20 +60,24 @@ class VisionDetector:
         self._debug_text_crop: Optional[np.ndarray] = None
         self._debug_enhanced_crop: Optional[np.ndarray] = None
         
-        # 배틀 상태 머신 ("IDLE" / "IN_BATTLE" / "CUTSCENE")
+        # 배틀 상태 머신 ("IDLE" / "IN_BATTLE" / "CUTSCENE" / "FAINTED")
         self.battle_state: str = "IDLE"
         self.is_paused: bool = False
         
-        # 확정된 안정 체력 상태
+        # 확정된 안정 체력 상태 & 세대(Epoch) 가드
         self.confirmed_curr_hp: int = 0
         self.confirmed_max_hp: int = 0
         self.current_hp_pct: float = 100.0
         self.confirmed_stable_hp_pct: Optional[float] = None
         self.last_triggered_hp_pct: Optional[float] = None
+        self._state_epoch: int = 0
         
         self.hud_visible: bool = False
         self.last_number_seen_time: float = 0.0
         self.last_switch_time: float = 0.0
+        self.measured_fps: float = 0.0
+        self._last_emitted_hp_sig: Optional[Tuple[int, bool, str]] = None
+        self._last_ocr_err_log_time: float = 0.0
         
         # 🔄 다수결 통계 합의 큐: [(timestamp, curr, max)]
         self._ocr_history: List[Tuple[float, int, int]] = []
@@ -101,17 +102,34 @@ class VisionDetector:
         self._ocr_dispatch_min_interval: float = 0.07
         self.set_detection_mode(self.detection_mode)
 
+    def _clear_ocr_queue(self) -> None:
+        while True:
+            try:
+                self._ocr_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def get_measured_fps(self) -> float:
+        with self._lock:
+            return self.measured_fps
+
+    def get_red_hp_snapshot(self) -> Tuple[int, float, float]:
+        """FusionEngine 빨간 체력 감시 스레드용 스레드 안전 상태 스냅샷"""
+        with self._lock:
+            return self.confirmed_curr_hp, self.current_hp_pct, self.last_number_seen_time
+
     def set_detection_mode(self, mode: str) -> None:
         """감지 모드 실시간 전환 ('fast', 'balanced', 'accurate')"""
         if mode not in ["fast", "balanced", "accurate"]:
             mode = "balanced"
-        self.detection_mode = mode
-        if mode == "fast":
-            self._ocr_dispatch_min_interval = 0.05
-        elif mode == "balanced":
-            self._ocr_dispatch_min_interval = 0.07
-        else: # accurate
-            self._ocr_dispatch_min_interval = 0.10
+        with self._lock:
+            self.detection_mode = mode
+            if mode == "fast":
+                self._ocr_dispatch_min_interval = 0.05
+            elif mode == "balanced":
+                self._ocr_dispatch_min_interval = 0.07
+            else: # accurate
+                self._ocr_dispatch_min_interval = 0.10
 
     @staticmethod
     def get_video_devices(max_check: int = 4) -> List[Dict[str, any]]:
@@ -193,17 +211,23 @@ class VisionDetector:
                 max(0.01, min(1.0, w)),
                 max(0.01, min(1.0, h))
             ]
+            self._state_epoch += 1
             self._ocr_history.clear()
+            self._clear_ocr_queue()
             self.confirmed_curr_hp = 0
             self.confirmed_max_hp = 0
             self.confirmed_stable_hp_pct = None
             self.last_triggered_hp_pct = None
             self._last_ocr_reading = None
+            self._last_emitted_hp_sig = None
 
     def toggle_pause(self) -> bool:
         """체력 감지 일시정지 / 재개 토글 (True: 일시정지됨, False: 재개됨)"""
         with self._lock:
             self.is_paused = not self.is_paused
+            self._state_epoch += 1
+            self._clear_ocr_queue()
+            self._last_emitted_hp_sig = None
             if not self.is_paused:
                 self._ocr_history.clear()
                 self.confirmed_stable_hp_pct = None
@@ -214,6 +238,8 @@ class VisionDetector:
     def reset_battle_state(self) -> None:
         """확정된 최대/현재 체력 잠금 및 OCR 히스토리를 완전히 초기화 (새 배틀/강제 리셋)"""
         with self._lock:
+            self._state_epoch += 1
+            self._clear_ocr_queue()
             self.confirmed_max_hp = 0
             self.confirmed_curr_hp = 0
             self.current_hp_pct = 100.0
@@ -223,6 +249,7 @@ class VisionDetector:
             self._last_ocr_raw_text = ""
             self._ocr_history.clear()
             self.last_switch_time = 0.0
+            self._last_emitted_hp_sig = None
 
     def calibrate_100_percent(self) -> None:
         """현재 체력바 상태를 초기 기준(100% 대기)으로 리셋"""
@@ -323,6 +350,8 @@ class VisionDetector:
         """60FPS 고속 프레임 캡처 루프 (하드웨어 V-Sync 동기화 & 가변 델타 제어 & 캡처 와치독)"""
         target_interval = 1.0 / 60.0
         last_frame_time = time.perf_counter()
+        fps_window_start = last_frame_time
+        fps_frames = 0
         consecutive_failures = 0
         last_reconnect_attempt = 0.0
         
@@ -341,6 +370,8 @@ class VisionDetector:
                 if consecutive_failures >= 30:  # 약 0.5초 연속 실패 시 신호 단절 판정
                     if self.is_camera_connected:
                         self.is_camera_connected = False
+                        with self._lock:
+                            self.measured_fps = 0.0
                         if self.on_camera_status:
                             try:
                                 self.on_camera_status(False, "⚠️ 캡처보드 신호 단절 감지: 자동 재연결 시도 중...")
@@ -366,6 +397,15 @@ class VisionDetector:
 
             consecutive_failures = 0
             self._process_frame(frame)
+
+            fps_frames += 1
+            now_perf = time.perf_counter()
+            fps_elapsed = now_perf - fps_window_start
+            if fps_elapsed >= 0.5:
+                with self._lock:
+                    self.measured_fps = fps_frames / fps_elapsed
+                fps_frames = 0
+                fps_window_start = now_perf
             
             # 🚀 가변 델타 슬립: cap.read()의 하드웨어 블로킹 속도를 존중하여 60FPS 초과 시에만 미세 슬립
             now = time.perf_counter()
@@ -375,10 +415,17 @@ class VisionDetector:
                 time.sleep(target_interval - elapsed)
 
     def _process_frame(self, frame: np.ndarray) -> None:
-        """단일 프레임 처리 (고속 디스패치 및 UI 렌더링)"""
+        """단일 프레임 처리 (스레드 안전 스냅샷, 시그널 쓰로틀링 및 UI 렌더링)"""
         h, w, _ = frame.shape
-        rx, ry, rw, rh = self.roi
-        
+        with self._lock:
+            rx, ry, rw, rh = self.roi
+            is_paused = self.is_paused
+            curr_hp = self.confirmed_curr_hp
+            max_hp = self.confirmed_max_hp
+            curr_pct = self.current_hp_pct
+            last_seen = self.last_number_seen_time
+            min_interval = self._ocr_dispatch_min_interval
+
         px = int(rx * w)
         py = int(ry * h)
         pw = int(rw * w)
@@ -392,15 +439,22 @@ class VisionDetector:
         roi_img = frame[py:py+ph, px:px+pw]
         
         # ⏸️ 일시정지 상태 처리
-        if self.is_paused:
-            self.hud_visible = False
+        if is_paused:
             status_detail = "⏸️ 체력 감지 일시정지 중"
             display_tag = "[ ⏸️ 체력 감지 일시정지 중 ]"
             roi_color = (0, 165, 255)
-            
-            if self.on_hp_update:
+            sig = (int(round(curr_pct)), False, status_detail)
+
+            should_emit = False
+            with self._lock:
+                self.hud_visible = False
+                if sig != self._last_emitted_hp_sig:
+                    self._last_emitted_hp_sig = sig
+                    should_emit = True
+
+            if should_emit and self.on_hp_update:
                 try:
-                    self.on_hp_update(self.current_hp_pct, 0.0, False, status_detail)
+                    self.on_hp_update(curr_pct, 0.0, False, status_detail)
                 except Exception:
                     pass
 
@@ -418,12 +472,6 @@ class VisionDetector:
 
         # 1. 텍스트 서브영역 분리 및 OCR 큐 전달 (100% 순수 숫자 전담 모드)
         rh_sub, rw_sub = roi_img.shape[:2]
-        # 🎯 적응형 OCR 크롭 (사용자 지정 ROI 크기 자동 감지):
-        # 사용자가 이미 체력바/숫자 위주로 타이트하게 지정한 경우 (높이 < 55, 너비 < 120, 또는 가로세로비 < 2.0):
-        # 좌측 여백을 임의로 자르면 '108'의 '1'이 잘려나가 '8/207'로 오인식되는 대참사가 발생합니다!
-        # 따라서 타이트한 ROI에서는 사용자 지정 영역 전체를 100% 보존합니다.
-        # 사용자가 포켓몬 이름/스프라이트까지 포함된 풀 배틀 카드를 지정한 대형 ROI일 때만
-        # 상단 이름 영역(35%)만 안전하게 배제하고, 좌측 숫자는 잘리지 않도록 안전 여백만 유지합니다.
         if rh_sub < 55 or rw_sub < 120 or (rw_sub / float(max(1, rh_sub))) < 2.0:
             num_crop = roi_img
             crop_rect_offset = (0, 0, pw, ph)
@@ -433,7 +481,7 @@ class VisionDetector:
             num_crop = roi_img[y_cut:, x_cut:]
             crop_rect_offset = (x_cut, y_cut, pw, ph)
         
-        if HAS_RAPID_OCR and (now - self._last_ocr_dispatch_time >= self._ocr_dispatch_min_interval):
+        if HAS_RAPID_OCR and (now - self._last_ocr_dispatch_time >= min_interval):
             self._last_ocr_dispatch_time = now
             try:
                 if self._ocr_queue.empty():
@@ -442,45 +490,51 @@ class VisionDetector:
                 pass
 
         # 3. 🎬 연출 자동 동결 (Cutscene Hold) 및 💀 기절(Fainted) 처리
-        time_since_number = now - self.last_number_seen_time
-        if self.confirmed_curr_hp <= 0 and self.confirmed_max_hp > 0:
-            self.hud_visible = False
-            self.battle_state = "FAINTED"
-            self.current_hp_pct = 0.0
+        time_since_number = now - last_seen
+        if curr_hp <= 0 and max_hp > 0:
+            hud_visible = False
+            battle_state = "FAINTED"
+            curr_pct = 0.0
             status_detail = "💀 포켓몬 기절 (HP: 0%)"
             roi_color = (128, 128, 128)
             display_tag = "[ 💀 포켓몬 기절 (HP: 0%) ]"
         elif time_since_number > 1.3:
-            self.hud_visible = False
-            self.battle_state = "CUTSCENE"
-            if self.confirmed_max_hp > 0 and self.confirmed_curr_hp > 0:
-                self.current_hp_pct = (self.confirmed_curr_hp / float(self.confirmed_max_hp)) * 100.0
-            status_detail = f"🎬 연출 중 (체력 유지: {self.current_hp_pct:.0f}%)"
+            hud_visible = False
+            battle_state = "CUTSCENE"
+            status_detail = f"🎬 연출 중 (체력 유지: {curr_pct:.0f}%)"
             roi_color = (255, 140, 0)
-            display_tag = f"[ 🎬 연출 중 (HP: {self.current_hp_pct:.0f}%) ]"
+            display_tag = f"[ 🎬 연출 중 (HP: {curr_pct:.0f}%) ]"
         else:
-            self.hud_visible = True
-            self.battle_state = "IN_BATTLE"
-            if self.confirmed_max_hp > 0 and self.confirmed_curr_hp > 0:
-                self.current_hp_pct = (self.confirmed_curr_hp / float(self.confirmed_max_hp)) * 100.0
-                
-            if self.current_hp_pct > 50:
+            hud_visible = True
+            battle_state = "IN_BATTLE"
+            if curr_pct > 50:
                 roi_color = (0, 255, 0)
-            elif self.current_hp_pct > 20:
+            elif curr_pct > 20:
                 roi_color = (0, 255, 255)
             else:
                 roi_color = (0, 0, 255)
                 
-            if self.confirmed_max_hp > 0:
-                display_tag = f"HP: {self.confirmed_curr_hp}/{self.confirmed_max_hp} ({self.current_hp_pct:.1f}%)"
+            if max_hp > 0:
+                display_tag = f"HP: {curr_hp}/{max_hp} ({curr_pct:.1f}%)"
                 status_detail = display_tag
             else:
-                display_tag = f"HP: {self.current_hp_pct:.0f}% (대기)"
+                display_tag = f"HP: {curr_pct:.0f}% (대기)"
                 status_detail = display_tag
 
-        if self.on_hp_update:
+        sig = (int(round(curr_pct)), hud_visible, status_detail)
+        should_emit = False
+        with self._lock:
+            self.hud_visible = hud_visible
+            self.battle_state = battle_state
+            if curr_hp <= 0 and max_hp > 0:
+                self.current_hp_pct = 0.0
+            if sig != self._last_emitted_hp_sig:
+                self._last_emitted_hp_sig = sig
+                should_emit = True
+
+        if should_emit and self.on_hp_update:
             try:
-                self.on_hp_update(self.current_hp_pct, 0.0, self.hud_visible, status_detail)
+                self.on_hp_update(curr_pct, 0.0, hud_visible, status_detail)
             except Exception:
                 pass
 
@@ -488,7 +542,6 @@ class VisionDetector:
         annotated = frame.copy()
         cv2.rectangle(annotated, (px, py), (px + pw, py + ph), roi_color, 1)
         corner_len = max(6, min(16, pw // 5, ph // 3))
-        # 좌상, 우상, 좌하, 우하 코너 브래킷 강조
         for (cx_p, cy_p, dx_s, dy_s) in [
             (px, py, 1, 1),
             (px + pw, py, -1, 1),
@@ -498,7 +551,6 @@ class VisionDetector:
             cv2.line(annotated, (cx_p, cy_p), (cx_p + dx_s * corner_len, cy_p), roi_color, 3)
             cv2.line(annotated, (cx_p, cy_p), (cx_p, cy_p + dy_s * corner_len), roi_color, 3)
 
-        # 디버그 스캔 박스: 실제 OCR 엔진으로 넘어가는 영역을 노란색 박스로 정밀 표시
         if crop_rect_offset[0] > 0 or crop_rect_offset[1] > 0:
             cv2.rectangle(annotated, 
                           (px + crop_rect_offset[0], py + crop_rect_offset[1]), 
@@ -517,10 +569,10 @@ class VisionDetector:
         r"""
         🔤 OCR 자주 발생하는 오인식 알파벳을 숫자로 스마트 정규화 (콜론 ':'은 타이머 구분을 위해 슬래시로 치환하지 않음)
         - O, o, Q, D -> 0
-        - I, l -> 1
         - S, s -> 5
         - Z, z -> 2
         - B -> 8
+        - g, q -> 9
         - / | \ ㅣ -> / (슬래시)
         """
         t = raw.strip()
@@ -676,15 +728,22 @@ class VisionDetector:
                 continue
 
             try:
+                # 0. 세대(Epoch) 및 일시정지 스냅샷
+                with self._lock:
+                    epoch = self._state_epoch
+                    known_max = self.confirmed_max_hp
+                    known_curr = self.confirmed_curr_hp
+                    detection_mode = self.detection_mode
+                    is_paused = self.is_paused
+                if is_paused:
+                    continue
+
                 # 🚀 [초고속 Early-Exit 사전 필터]
                 # 암전이나 어두운 컷신 등 밝은 텍스트 픽셀(V>140)이 0.8% 미만이면 불필요한 3중 ONNX 추론을 생략
                 raw_gray_small = cv2.cvtColor(roi_crop, cv2.COLOR_BGR2GRAY)
                 bright_ratio = np.count_nonzero(raw_gray_small > 140) / float(max(1, raw_gray_small.size))
                 if bright_ratio < 0.008:
                     continue
-
-                known_max = self.confirmed_max_hp
-                known_curr = self.confirmed_curr_hp
 
                 # 1. 🔍 3.0x 고품질 바이큐빅 확대
                 scaled = cv2.resize(roi_crop, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
@@ -699,12 +758,12 @@ class VisionDetector:
                 with self._lock:
                     self._debug_enhanced_crop = enhanced_gray
                 parsed_pair = None
+                last_raw_text = ""
 
                 result1, _ = self._ocr_engine(enhanced_gray)
                 result2 = None
                 if result1:
-                    parsed_pair, raw_text1 = self.parse_ocr_results_smart(result1, known_max, known_curr)
-                    self._last_ocr_raw_text = raw_text1
+                    parsed_pair, last_raw_text = self.parse_ocr_results_smart(result1, known_max, known_curr)
 
                 # --- [파이프라인 2차: 순수 화이트 마스크 (HSV V>160, S<80)] ---
                 # 1차에서 텍스트 박스가 아예 0개이고 밝은 픽셀도 희박(<2.5%)하면 컷신 화면이므로 2·3차 생략 (즉각 복귀 보장)
@@ -715,7 +774,8 @@ class VisionDetector:
                     result2, _ = self._ocr_engine(mask_white)
                     if result2:
                         parsed_pair, raw_text2 = self.parse_ocr_results_smart(result2, known_max, known_curr)
-                        self._last_ocr_raw_text = raw_text2
+                        if raw_text2:
+                            last_raw_text = raw_text2
 
                 # --- [파이프라인 3차: 이진화 Otsu Threshold] ---
                 if parsed_pair is None and (result1 or result2):
@@ -723,138 +783,167 @@ class VisionDetector:
                     result3, _ = self._ocr_engine(otsu)
                     if result3:
                         parsed_pair, raw_text3 = self.parse_ocr_results_smart(result3, known_max, known_curr)
-                        self._last_ocr_raw_text = raw_text3
+                        if raw_text3:
+                            last_raw_text = raw_text3
 
                 # =====================================================================
-                # 📊 3. 유효 수치 검증 & 🛡️ 4. 2~3프레임 연속 합의 락
+                # 📊 3. 스레드 안전 상태 머신 갱신 (락 내부에서는 콜백 미실행)
                 # =====================================================================
                 if parsed_pair:
                     curr, max_hp = parsed_pair
                     ocr_hp_pct = (curr / float(max_hp)) * 100.0
-
                     now = time.time()
 
-                    # 유효한 수치가 판독되었으므로 실시간 타임스탬프 갱신 (연출 오판 방지)
-                    self.last_number_seen_time = now
-                    self._last_ocr_reading = (curr, max_hp, ocr_hp_pct)
-                    
-                    # 1.5초 슬라이딩 윈도우 히스토리
-                    self._ocr_history.append((now, curr, max_hp))
-                    self._ocr_history = [item for item in self._ocr_history if now - item[0] <= 1.5]
-                    
-                    # --- [A. 포켓몬 교체 감지 (최대 체력 변경)] ---
-                    if self.confirmed_max_hp > 0 and max_hp != self.confirmed_max_hp:
-                        # 🛡️ [핵심 개선: 교체 시에도 2프레임 연속 합의 락 강제 적용]
-                        # 찰나의 1프레임 오독(예: 197이 1번 261로 튐)으로 즉시 교체 처리되어 체력이 출렁이는 것을 100% 방지
-                        recent_maxes = [item[2] for item in self._ocr_history[-2:]]
-                        is_real_switch = (len(recent_maxes) >= 2 and recent_maxes[0] == max_hp and recent_maxes[1] == max_hp)
+                    pending_switch: Optional[Tuple[int, int, float]] = None
+                    pending_damage: Optional[Tuple[float, float, float]] = None
+                    pending_heal: Optional[Tuple[float, float]] = None
 
-                        if is_real_switch:
-                            old_max = self.confirmed_max_hp
-                            self.confirmed_max_hp = max_hp
-                            self.confirmed_curr_hp = curr
-                            self.current_hp_pct = ocr_hp_pct
-                            self.confirmed_stable_hp_pct = ocr_hp_pct
-                            self.last_triggered_hp_pct = ocr_hp_pct
-                            self.last_switch_time = now
-                            self._ocr_history.clear()
-                            
-                            if self.on_pokemon_switched:
-                                try:
-                                    self.on_pokemon_switched(old_max, max_hp, ocr_hp_pct)
-                                except Exception:
-                                    pass
-                        else:
-                            # 1프레임 튀는 수치는 교체로 인정하지 않고 즉시 기각!
+                    with self._lock:
+                        if epoch != self._state_epoch or self.is_paused or not self._is_running:
                             continue
-                                
-                    # --- [B. 첫 진입 (초기 기준 체력 설정)] ---
-                    elif self.confirmed_max_hp == 0 or self.confirmed_curr_hp == 0:
-                        recent_maxes = [item[2] for item in self._ocr_history[-2:]]
-                        if len(recent_maxes) >= 2 and recent_maxes[0] == max_hp and recent_maxes[1] == max_hp:
-                            self.confirmed_max_hp = max_hp
-                            self.confirmed_curr_hp = curr
-                            self.current_hp_pct = ocr_hp_pct
-                            self.confirmed_stable_hp_pct = ocr_hp_pct
-                            self.last_triggered_hp_pct = ocr_hp_pct
-                        elif self.detection_mode == "fast":
-                            self.confirmed_max_hp = max_hp
-                            self.confirmed_curr_hp = curr
-                            self.current_hp_pct = ocr_hp_pct
-                            self.confirmed_stable_hp_pct = ocr_hp_pct
-                            self.last_triggered_hp_pct = ocr_hp_pct
-                        else:
-                            continue
-                        
-                    # --- [C. 정상 배틀 중 체력 갱신 (max_hp == self.confirmed_max_hp)] ---
-                    else:
-                        is_switch_protected = (now - self.last_switch_time < 0.8)
 
-                        # 💥 1) 데미지 피격 감지 (curr < self.confirmed_curr_hp)
-                        if curr < self.confirmed_curr_hp:
-                            should_trigger = False
+                        self.last_number_seen_time = now
+                        self._last_ocr_reading = (curr, max_hp, ocr_hp_pct)
+                        if last_raw_text:
+                            self._last_ocr_raw_text = last_raw_text
 
-                            # ⚡ 모드 A & B: 초고속(fast) 및 균형(balanced) 모드
-                            # - 최대 HP(예: 197)가 정확히 일치하고 현재 체력이 감소한 유효 판독은
-                            #   배경 조명이나 게이지 왜곡에 구애받지 않고 1프레임 즉각 확정 및 피격 진동 발동!
-                            if self.detection_mode in ["fast", "balanced"]:
-                                should_trigger = True
-                            # 🎯 모드 C: 고정밀 모드 (accurate)
-                            # - 2프레임 연속 동일 수치 합의 락 (안전망: CPU 연산 지연 감안 1.5초 윈도우)
+                        # 1.5초 슬라이딩 윈도우 히스토리
+                        self._ocr_history.append((now, curr, max_hp))
+                        self._ocr_history = [item for item in self._ocr_history if now - item[0] <= 1.5]
+
+                        # --- [A. 포켓몬 교체 감지 (최대 체력 변경)] ---
+                        if self.confirmed_max_hp > 0 and max_hp != self.confirmed_max_hp:
+                            recent_maxes = [item[2] for item in self._ocr_history[-2:]]
+                            is_real_switch = (len(recent_maxes) >= 2 and recent_maxes[0] == max_hp and recent_maxes[1] == max_hp)
+
+                            if is_real_switch:
+                                old_max = self.confirmed_max_hp
+                                self.confirmed_max_hp = max_hp
+                                self.confirmed_curr_hp = curr
+                                self.current_hp_pct = ocr_hp_pct
+                                self.confirmed_stable_hp_pct = ocr_hp_pct
+                                self.last_triggered_hp_pct = ocr_hp_pct
+                                self.last_switch_time = now
+                                self._ocr_history.clear()
+                                pending_switch = (old_max, max_hp, ocr_hp_pct)
                             else:
+                                continue
+
+                        # --- [B. 첫 진입 또는 기절 후 교체 진입] ---
+                        elif self.confirmed_max_hp == 0 or self.confirmed_curr_hp == 0:
+                            if self.confirmed_max_hp > 0 and self.confirmed_curr_hp == 0 and curr == 0:
+                                continue
+
+                            recent_maxes = [item[2] for item in self._ocr_history[-2:]]
+                            is_confirmed_init = (
+                                (len(recent_maxes) >= 2 and recent_maxes[0] == max_hp and recent_maxes[1] == max_hp)
+                                or detection_mode == "fast"
+                            )
+                            if not is_confirmed_init:
+                                continue
+
+                            was_fainted = (self.confirmed_max_hp > 0 and self.confirmed_curr_hp == 0)
+                            old_max = self.confirmed_max_hp
+
+                            self.confirmed_max_hp = max_hp
+                            self.confirmed_curr_hp = curr
+                            self.current_hp_pct = ocr_hp_pct
+                            self.confirmed_stable_hp_pct = ocr_hp_pct
+                            self.last_triggered_hp_pct = ocr_hp_pct
+
+                            if was_fainted and curr > 0:
+                                self.last_switch_time = now
+                                pending_switch = (old_max, max_hp, ocr_hp_pct)
+
+                        # --- [C. 정상 배틀 중 체력 갱신 (max_hp == self.confirmed_max_hp)] ---
+                        else:
+                            is_switch_protected = (now - self.last_switch_time < 0.8)
+
+                            # 💥 1) 데미지 피격 감지 (curr < self.confirmed_curr_hp)
+                            if curr < self.confirmed_curr_hp:
                                 recent_currs = [item[1] for item in self._ocr_history if item[2] == self.confirmed_max_hp]
-                                if len(recent_currs) >= 2:
-                                    time_gap = self._ocr_history[-1][0] - self._ocr_history[-2][0]
-                                    if time_gap <= 1.5 and recent_currs[-1] == recent_currs[-2] == curr:
+                                has_2f_consensus = (
+                                    len(recent_currs) >= 2
+                                    and (self._ocr_history[-1][0] - self._ocr_history[-2][0]) <= 1.5
+                                    and recent_currs[-1] == recent_currs[-2] == curr
+                                )
+
+                                if curr == 0:
+                                    # 기절은 min_damage_threshold / switch_protection 무관하게 확정
+                                    should_trigger = True if detection_mode in ["fast", "balanced"] else has_2f_consensus
+                                    if should_trigger:
+                                        damage_delta = (self.confirmed_curr_hp / float(max_hp)) * 100.0
+                                        self.confirmed_curr_hp = 0
+                                        self.current_hp_pct = 0.0
+                                        self.confirmed_stable_hp_pct = 0.0
+                                        self.last_triggered_hp_pct = 0.0
+                                        pending_damage = (damage_delta, 0.0, now)
+                                else:
+                                    if is_switch_protected or detection_mode == "accurate":
+                                        should_trigger = has_2f_consensus
+                                    else:
                                         should_trigger = True
 
-                            if should_trigger:
-                                damage_delta = ((self.confirmed_curr_hp - curr) / float(max_hp)) * 100.0
-                                self.confirmed_curr_hp = curr
-                                self.current_hp_pct = (curr / float(max_hp)) * 100.0
-                                self.confirmed_stable_hp_pct = self.current_hp_pct
-                                self.last_triggered_hp_pct = self.current_hp_pct
-                                
-                                if damage_delta >= self.min_damage_threshold and not is_switch_protected:
-                                    if self.on_damage_detected:
-                                        try:
-                                            self.on_damage_detected(damage_delta, self.current_hp_pct, now)
-                                        except Exception as e:
-                                            print(f"[Vision] 피격 트리거 오류: {e}")
+                                    if should_trigger:
+                                        damage_delta = ((self.confirmed_curr_hp - curr) / float(max_hp)) * 100.0
+                                        live_hp_pct = (curr / float(max_hp)) * 100.0
+                                        if damage_delta >= self.min_damage_threshold:
+                                            self.confirmed_curr_hp = curr
+                                            self.current_hp_pct = live_hp_pct
+                                            self.confirmed_stable_hp_pct = live_hp_pct
+                                            self.last_triggered_hp_pct = live_hp_pct
+                                            pending_damage = (damage_delta, live_hp_pct, now)
+                                        else:
+                                            # 소량 피해는 기준 체력을 유지해 누적 감지하되 UI 퍼센트만 실시간 반영
+                                            self.current_hp_pct = live_hp_pct
 
-                        # 🌿 2) 체력 회복 / 힐 (curr > self.confirmed_curr_hp)
-                        elif curr > self.confirmed_curr_hp:
-                            should_heal = False
+                            # 🌿 2) 체력 회복 / 힐 (curr > self.confirmed_curr_hp)
+                            elif curr > self.confirmed_curr_hp:
+                                if detection_mode in ["fast", "balanced"]:
+                                    should_heal = True
+                                else:
+                                    recent_currs = [item[1] for item in self._ocr_history if item[2] == self.confirmed_max_hp]
+                                    should_heal = (
+                                        len(recent_currs) >= 2
+                                        and (self._ocr_history[-1][0] - self._ocr_history[-2][0]) <= 1.5
+                                        and recent_currs[-1] == recent_currs[-2] == curr
+                                    )
 
-                            # 초고속 및 균형 모드: 1프레임 즉시 회복 승인!
-                            if self.detection_mode in ["fast", "balanced"]:
-                                should_heal = True
-                            # 고정밀 모드: 2프레임 연속 동일 수치 합의
+                                if should_heal:
+                                    heal_delta = ((curr - self.confirmed_curr_hp) / float(max_hp)) * 100.0
+                                    self.confirmed_curr_hp = curr
+                                    self.current_hp_pct = (curr / float(max_hp)) * 100.0
+                                    self.confirmed_stable_hp_pct = self.current_hp_pct
+                                    self.last_triggered_hp_pct = self.current_hp_pct
+                                    pending_heal = (heal_delta, self.current_hp_pct)
+
+                            # 🛡️ 3) 현재 수치와 일치하여 안정 상태 유지
                             else:
-                                recent_currs = [item[1] for item in self._ocr_history if item[2] == self.confirmed_max_hp]
-                                if len(recent_currs) >= 2:
-                                    time_gap = self._ocr_history[-1][0] - self._ocr_history[-2][0]
-                                    if time_gap <= 1.5 and recent_currs[-1] == recent_currs[-2] == curr:
-                                        should_heal = True
+                                if self.confirmed_max_hp > 0:
+                                    self.current_hp_pct = (self.confirmed_curr_hp / float(self.confirmed_max_hp)) * 100.0
 
-                            if should_heal:
-                                heal_delta = ((curr - self.confirmed_curr_hp) / float(max_hp)) * 100.0
-                                self.confirmed_curr_hp = curr
-                                self.current_hp_pct = (curr / float(max_hp)) * 100.0
-                                self.confirmed_stable_hp_pct = self.current_hp_pct
-                                self.last_triggered_hp_pct = self.current_hp_pct
+                    # 콜백은 반드시 self._lock 해제 후 실행 (데드락 방지)
+                    if pending_switch is not None and self.on_pokemon_switched:
+                        try:
+                            self.on_pokemon_switched(*pending_switch)
+                        except Exception as e:
+                            print(f"[Vision] 교체 콜백 오류: {e}")
 
-                                if self.on_heal_detected:
-                                    try:
-                                        self.on_heal_detected(heal_delta, self.current_hp_pct)
-                                    except Exception:
-                                        pass
+                    if pending_damage is not None and self.on_damage_detected:
+                        try:
+                            self.on_damage_detected(*pending_damage)
+                        except Exception as e:
+                            print(f"[Vision] 피격 트리거 오류: {e}")
 
-                        # 🛡️ 3) 현재 수치와 일치하여 안정 상태 유지
-                        else:
-                            if self.confirmed_max_hp > 0:
-                                self.current_hp_pct = (self.confirmed_curr_hp / float(self.confirmed_max_hp)) * 100.0
+                    if pending_heal is not None and self.on_heal_detected:
+                        try:
+                            self.on_heal_detected(*pending_heal)
+                        except Exception as e:
+                            print(f"[Vision] 회복 콜백 오류: {e}")
 
             except Exception as e:
-                pass
+                now_err = time.time()
+                if now_err - self._last_ocr_err_log_time >= 5.0:
+                    self._last_ocr_err_log_time = now_err
+                    print(f"[Vision] OCR 워커 오류: {e}")
             time.sleep(0.04)

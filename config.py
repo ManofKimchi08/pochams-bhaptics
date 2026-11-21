@@ -1,9 +1,35 @@
 import os
+import sys
 import json
+import threading
 from dataclasses import dataclass, field, asdict
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+BASE_DIR = (
+    os.path.dirname(sys.executable)
+    if getattr(sys, "frozen", False)
+    else os.path.dirname(os.path.abspath(__file__))
+)
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+_SAVE_LOCK = threading.Lock()
+
+
+def classify_damage_magnitude(damage_percent: float) -> Tuple[str, str]:
+    """피해 비율(%)만으로 피격 등급 키와 한글 표시명 반환"""
+    if damage_percent <= 20.0:
+        return "light", "경타"
+    if damage_percent <= 50.0:
+        return "medium", "중타"
+    if damage_percent <= 80.0:
+        return "heavy", "강타"
+    return "critical", "치명타"
+
+
+def classify_damage_tier(damage_percent: float, current_hp_pct: float = 100.0) -> Tuple[str, str]:
+    """잔여 체력 및 피해 비율을 반영한 단일 표준 피격 등급 분류기"""
+    if current_hp_pct <= 0.0:
+        return "faint", "기절"
+    return classify_damage_magnitude(damage_percent)
 
 @dataclass
 class HapticSinkConfig:
@@ -56,7 +82,6 @@ class AppConfig:
     video_device_index: int = 0
     video_width: int = 1280
     video_height: int = 720
-    fps: int = 30
     
     # 아군 HP 바 ROI (정규화 좌표: 0.0 ~ 1.0 - 포챔스 배틀 체력 카드에 정확히 맞춤)
     hp_roi: list[float] = field(default_factory=lambda: [0.045, 0.828, 0.195, 0.148])
@@ -64,9 +89,6 @@ class AppConfig:
     # 비전 감지 설정
     detection_mode: str = "balanced"        # 감지 모드 ("fast": 초고속, "balanced": 균형 6:4, "accurate": 고정밀 8.5:1.5)
     min_damage_threshold: float = 3.0       # 최소 데미지 감지 기준 (% 단위)
-    hp_confirm_frames: int = 3
-    deadband_percent: float = 2.0
-    debounce_ms: int = 350
     
     # 빨간 체력 기준치 (% 단위, 기본 20.0%)
     red_hp_threshold: float = 20.0
@@ -82,8 +104,7 @@ class AppConfig:
     overlay_show_front: bool = True         # 정면 오버레이 표시 여부
     overlay_show_back: bool = True          # 후면 오버레이 표시 여부
     
-    # UI 접힘 및 컴팩트 모드 위치 상태
-    sdk_settings_collapsed: bool = True
+    # 컴팩트 모드 위치 상태
     compact_mode_x: int = 180
     compact_mode_y: int = 36
     
@@ -94,21 +115,35 @@ class AppConfig:
         "HP": True,
         "STATE": True,
         "HAPTIC": True,
+        "CAMERA": True,
         "SYSTEM": True
     })
 
     def save(self, filepath: str = CONFIG_FILE) -> None:
-        """설정을 JSON 파일로 저장"""
-        try:
-            data = asdict(self)
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
-        except Exception as e:
-            print(f"[Config] 설정 저장 실패: {e}")
+        """설정을 JSON 파일로 원자적(Atomic)이고 스레드 안전하게 저장"""
+        tmp_path = f"{filepath}.tmp"
+        with _SAVE_LOCK:
+            try:
+                parent_dir = os.path.dirname(os.path.abspath(filepath))
+                if parent_dir:
+                    os.makedirs(parent_dir, exist_ok=True)
+                data = asdict(self)
+                with open(tmp_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=4, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, filepath)
+            except Exception as e:
+                print(f"[Config] 설정 저장 실패: {e}")
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except OSError:
+                    pass
 
     @classmethod
     def load(cls, filepath: str = CONFIG_FILE) -> 'AppConfig':
-        """JSON 파일에서 설정을 불러오며, 없으면 기본값 반환"""
+        """JSON 파일에서 설정을 불러오며, 없으면 기본값 반환 (미지 필드 안전 필터링)"""
         if not os.path.exists(filepath):
             config = cls()
             config.save(filepath)
@@ -117,20 +152,26 @@ class AppConfig:
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            
+            if not isinstance(data, dict):
+                return cls()
+
             data.pop("bhaptics_ws_url", None)
             data.pop("haptic_position", None)  # 개별 옵션으로 전환됨
-            
-            sink_data = data.pop("sink", {})
+
+            raw_sink = data.pop("sink", {})
+            sink_fields = HapticSinkConfig.__dataclass_fields__
+            sink_data = {k: v for k, v in raw_sink.items() if k in sink_fields} if isinstance(raw_sink, dict) else {}
             sink_data["kind"] = "bhaptics"
             sink = HapticSinkConfig(**sink_data)
-            
-            details_data = data.pop("haptic_details", {})
-            rows = {}
+
+            raw_details = data.pop("haptic_details", {})
+            details_data = raw_details if isinstance(raw_details, dict) else {}
+            row_fields = HapticDetailRow.__dataclass_fields__
+            rows: Dict[str, Any] = {}
             for k in ["light", "medium", "heavy", "critical", "faint", "heartbeat", "low_hp_loop"]:
-                if k in details_data:
-                    row_dict = details_data[k]
-                    # position 필드가 없을 경우 기본 "All"
+                raw_row = details_data.get(k)
+                if isinstance(raw_row, dict):
+                    row_dict = {rk: rv for rk, rv in raw_row.items() if rk in row_fields}
                     if "position" not in row_dict:
                         row_dict["position"] = "All"
                     rows[k] = HapticDetailRow(**row_dict)
@@ -141,8 +182,17 @@ class AppConfig:
             if "enable_ripple_effect" in details_data:
                 rows["enable_ripple_effect"] = bool(details_data["enable_ripple_effect"])
             haptic_details = DetailedHapticConfig(**rows)
-            
+
             valid_fields = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+            default_filter = cls().log_filter
+            loaded_filter = valid_fields.get("log_filter")
+            if isinstance(loaded_filter, dict):
+                merged_filter = dict(default_filter)
+                merged_filter.update({k: bool(v) for k, v in loaded_filter.items() if k in default_filter or isinstance(v, bool)})
+                valid_fields["log_filter"] = merged_filter
+            else:
+                valid_fields.pop("log_filter", None)
+
             config = cls(sink=sink, haptic_details=haptic_details, **valid_fields)
             return config
         except Exception as e:

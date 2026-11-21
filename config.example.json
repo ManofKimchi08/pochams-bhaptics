@@ -7,32 +7,84 @@
         "front_gain": 1.0,
         "back_gain": 1.0
     },
+    "haptic_details": {
+        "light": {
+            "intensity": 100,
+            "duration": 0.26,
+            "hit_count": 1,
+            "position": "All"
+        },
+        "medium": {
+            "intensity": 100,
+            "duration": 0.42,
+            "hit_count": 2,
+            "position": "All"
+        },
+        "heavy": {
+            "intensity": 100,
+            "duration": 0.48,
+            "hit_count": 3,
+            "position": "All"
+        },
+        "critical": {
+            "intensity": 100,
+            "duration": 0.52,
+            "hit_count": 4,
+            "position": "All"
+        },
+        "faint": {
+            "intensity": 100,
+            "duration": 0.9,
+            "hit_count": 2,
+            "position": "All"
+        },
+        "heartbeat": {
+            "intensity": 100,
+            "duration": 0.15,
+            "hit_count": 1,
+            "position": "All"
+        },
+        "low_hp_loop": {
+            "intensity": 100,
+            "duration": 0.42,
+            "hit_count": 1,
+            "position": "All"
+        },
+        "front_balance": 100,
+        "back_balance": 100,
+        "enable_ripple_effect": true
+    },
+    "master_intensity": 100,
     "video_device_index": 0,
     "video_width": 1280,
     "video_height": 720,
-    "fps": 30,
     "hp_roi": [
-        0.05,
-        0.65,
-        0.25,
-        0.12
+        0.045,
+        0.828,
+        0.195,
+        0.148
     ],
+    "detection_mode": "balanced",
     "min_damage_threshold": 3.0,
-    "hp_confirm_frames": 6,
-    "deadband_percent": 2.0,
-    "debounce_ms": 350,
-    "haptic_light_intensity": 40,
-    "haptic_light_duration": 180,
-    "haptic_medium_intensity": 70,
-    "haptic_medium_duration": 280,
-    "haptic_heavy_intensity": 90,
-    "haptic_heavy_duration": 450,
-    "haptic_critical_intensity": 100,
-    "haptic_critical_duration": 700,
-    "haptic_position": "VestFront",
-    "show_visual_overlay": true,
+    "red_hp_threshold": 20.0,
     "show_floating_overlay": true,
-    "floating_overlay_x": 60,
-    "floating_overlay_y": 60,
-    "bhaptics_ws_url": "ws://127.0.0.1:15881/v2/feedbacks"
+    "floating_front_x": 60,
+    "floating_front_y": 60,
+    "floating_back_x": 200,
+    "floating_back_y": 60,
+    "overlay_scale": 1.0,
+    "overlay_opacity": 0.95,
+    "overlay_show_front": true,
+    "overlay_show_back": true,
+    "compact_mode_x": 180,
+    "compact_mode_y": 36,
+    "log_font_size": 11,
+    "log_filter": {
+        "DAMAGE": true,
+        "HP": true,
+        "STATE": true,
+        "HAPTIC": true,
+        "CAMERA": true,
+        "SYSTEM": true
+    }
 }

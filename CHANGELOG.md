@@ -4,7 +4,44 @@
 
 ---
 
-## 🏷️ [v3.0.0] - 2026-11-13 (Latest)
+## 🏷️ [v3.1.0] - 2026-11-21 (Latest)
+
+### 🛡️ 버그 수정 & 로직 정합성 (Bug Fixes & Accuracy)
+- **피격 등급 경계값 단일화 (`config.classify_damage_tier`, `classify_damage_magnitude`)**:
+  - `fusion_engine.py`, `battle_analytics.py`, `haptic_manager.py` 간 어긋나 있던 `20% / 50% / 80%` 경계 판정을 단일 헬퍼로 통일하여 로그·통계·실제 진동 단계 100% 일치.
+- **연속기 막타 기절(`faint`) 디바운스 우회**:
+  - `current_hp_pct <= 0.0`일 때는 다단히트 디바운스를 우회하여 기절 진동이 누락되지 않도록 수정.
+- **소량 피해 누적 & 기절/교체 상태 머신 보완 (`VisionDetector`)**:
+  - 기절(`curr == 0`)은 `min_damage_threshold`·교체 보호(`0.8s`)와 무관하게 즉시 확정.
+  - 기준 미달 소량 피해 발생 시 기준 체력(`confirmed_curr_hp`)을 성급히 내리지 않고 앵커로 유지해 누적 피해가 기준에 도달할 때 정상 발동.
+  - 기절(`0`) 이후 새 포켓몬이 등장하면 `on_pokemon_switched`를 정상 발행해 빨간 체력(20% 이하) 상태 즉시 동기화.
+- **설정 영속성 및 PyInstaller 경로 보완 (`config.py`, `config.example.json`)**:
+  - `getattr(sys, "frozen", False)` 분기로 PyInstaller `--onedir` 빌드에서 `Pochams_bHaptics.exe` 옆 `config.json`을 사용하도록 수정.
+  - `_SAVE_LOCK` + 임시 파일 + `os.fsync` + `os.replace` 기반 원자적 저장 및 구버전/알 수 없는 키 안전 필터링 적용.
+  - 미사용 레거시 필드 정리 및 `"CAMERA"` 로그 카테고리 기본 병합.
+
+### 🔒 동시성 · 스레드 안전성 · 성능 최적화
+- **비전 스레드 락 격리 및 60Hz 신호 쓰로틀링 (`VisionDetector`)**:
+  - `_state_epoch` 세대 가드 도입으로 `reset_battle_state` / `set_roi` / `toggle_pause` 직후 지연된 OCR 결과 덮어쓰기 차단.
+  - 락 해제 후 콜백 호출로 데드락 위험 제거, `_last_emitted_hp_sig` 캐싱으로 동일 HP 상태 중복 시그널 제거, 0.5초 창 실측 FPS(`get_measured_fps()`) 적용.
+- **햅틱 워커 수명주기 & 파동 선점 개선 (`HapticManager`)**:
+  - `stop()` 시 워커·버스트 스레드 `join()` 및 큐 드레인으로 중복 워커 누수 방지, UI 스레드 블로킹 없는 `_reconnect_worker()` 비동기 재연결 적용.
+  - `_interruptible_sleep()` 도입으로 `_exec_ripple_burst()` 및 다중 버스트 도중에도 후속 타격/기절 즉시 선점.
+- **배틀 통계 스레드 안전성 & 스크롤 튕김 제거 (`BattleAnalytics`, `BattleAnalyticsDialog`)**:
+  - `threading.RLock`, `deque(maxlen=500)`, `_events_version` 도입으로 타임라인 변경 시에만 HTML 재렌더링.
+- **UI 렌더링·디스크 I/O 최적화 (`ui/`)**:
+  - `QImage` NumPy 버퍼 `np.ascontiguousarray(...).copy()`, 60Hz 틱 FPS/배지 상태 캐싱, 슬라이더 200~250ms 디바운스 저장, 프리셋 일괄 적용 시 `config.save()` 1회 호출.
+  - F11 이중 바인딩 및 버튼 텍스트 불일치 수정, `_append_log()` HTML 이스케이프(`html.escape`) 및 `_in_compact_mode` 도크 토글 상태 보호.
+
+### 🏗️ 아키텍처 모듈화 & 테스트 추가
+- **UI 패키지 분리 (`ui/`) & 미사용 모듈 정리**:
+  - `main.py`를 `ui/widgets.py`, `ui/compact_hud.py`, `ui/haptic_panel.py`, `ui/analytics_dialog.py`, `ui/main_window.py`로 분리하고 미사용 `audio_detector.py` 제거.
+- **자동화 단위·오프스크린 UI 테스트 (`tests/test_core.py`)**:
+  - 피격 경계값 일관성, 설정 안전 로드/저장, OCR 파서, 기절 디바운스 우회, 햅틱 워커 종료/파동 선점, 통계 동시성, `MainWindow` 오프스크린 동작 검증 9종 구축.
+
+---
+
+## 🏷️ [v3.0.0] - 2026-11-13
 
 ### 🎨 UI/UX 전면 개편 (PokéChamps SV Glassmorphism & 컴팩트 모드)
 - **3안: 포챔스 SV 글래스모피즘 테마 (`MainWindow`)**:

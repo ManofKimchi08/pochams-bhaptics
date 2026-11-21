@@ -1,7 +1,7 @@
 import time
 import threading
 from typing import Callable, Optional, List, Dict
-from config import AppConfig
+from config import AppConfig, classify_damage_tier
 from haptic_manager import HapticManager
 from vision_detector import VisionDetector
 from battle_analytics import BattleAnalytics
@@ -25,8 +25,6 @@ class FusionEngine:
             height=self.config.video_height,
             roi=self.config.hp_roi,
             min_damage_threshold=self.config.min_damage_threshold,
-            buffer_size=self.config.hp_confirm_frames,
-            max_jitter_percent=self.config.deadband_percent,
             detection_mode=getattr(self.config, "detection_mode", "balanced")
         )
         
@@ -66,6 +64,9 @@ class FusionEngine:
     def stop(self) -> None:
         """엔진 컴포넌트 정지"""
         self._is_running = False
+        if self._red_hp_thread and self._red_hp_thread.is_alive():
+            self._red_hp_thread.join(timeout=1.0)
+        self._red_hp_thread = None
         self.vision.stop()
         self.haptics.stop()
         self.log("SYSTEM", "연동 엔진이 정지되었습니다.")
@@ -163,27 +164,15 @@ class FusionEngine:
                 self._is_red_hp_active = True
                 self.log("HP", f"🚨 빨간 체력 진입! (잔여 체력: {current_hp_pct:.1f}% <= {red_threshold:.0f}%) [심장박동/상시진동 활성 (연출 중에도 지속)]")
 
-        # 2. 피격 등급 판정 및 통계 기록
-        level_key = "light"
-        level = "경타"
-        if current_hp_pct <= 0.0:
-            level_key = "faint"
-            level = "기절"
+        # 2. 피격 등급 판정 및 통계 기록 (단일 표준 분류기 사용)
+        level_key, level = classify_damage_tier(delta_hp, current_hp_pct)
+        if level_key == "faint":
             self._is_red_hp_active = False
-        elif delta_hp >= 80.0:
-            level_key = "critical"
-            level = "치명타"
-        elif delta_hp >= 50.0:
-            level_key = "heavy"
-            level = "강타"
-        elif delta_hp >= 20.0:
-            level_key = "medium"
-            level = "중타"
 
         self.analytics.record_damage(delta_hp, current_hp_pct, level_key, level)
         self.log("DAMAGE", f"💥 피격 데미지: -{delta_hp:.1f}% (남은 HP: {current_hp_pct:.1f}%) -> [{level}]")
 
-        # 3. 디바운스 검사 (감지 프로필별 차등 디바운스 및 연속 공격기 적응형 디바운스 적용)
+        # 3. 디바운스 검사 (단, 기절 이벤트는 연속 타격 막타에서도 절대 누락되지 않도록 디바운스 우회)
         mode = getattr(self.config, "detection_mode", "balanced")
         if mode == "fast":
             base_debounce = 0.06
@@ -197,7 +186,7 @@ class FusionEngine:
 
         time_since_last_hit = now - self._last_haptic_trigger_time
         effective_debounce = combo_debounce if time_since_last_hit < 0.9 else base_debounce
-        if time_since_last_hit < effective_debounce:
+        if level_key != "faint" and time_since_last_hit < effective_debounce:
             return
 
         self._last_haptic_trigger_time = now
@@ -208,10 +197,11 @@ class FusionEngine:
         last_loop_time = 0.0
         while self._is_running:
             now = time.time()
-            time_since_seen = now - self.vision.last_number_seen_time
+            confirmed_curr_hp, current_hp_pct, last_number_seen_time = self.vision.get_red_hp_snapshot()
+            time_since_seen = now - last_number_seen_time
             
             # 💀 1. 기절 상태 엄격 검사 (체력 0 이거나 기절 상태면 즉시 빨간 체력 영구 해제)
-            if self.vision.confirmed_curr_hp <= 0 or self.vision.current_hp_pct <= 0.0:
+            if confirmed_curr_hp <= 0 or current_hp_pct <= 0.0:
                 self._is_red_hp_active = False
             
             # ⏱️ 6대 안전망 검증:
@@ -219,7 +209,7 @@ class FusionEngine:
             # 2) 수동 일시정지 아님
             # 3) 잔여 체력 > 0 (기절 아님) & 확정 체력 > 0
             # 4) 최근 8.0초 이내 숫자 인식됨 (포챔스의 긴 스킬 컷신/카메라 회전 중에도 끊김 없이 지속)
-            is_alive_red = self._is_red_hp_active and (self.vision.current_hp_pct > 0.0) and (self.vision.confirmed_curr_hp > 0)
+            is_alive_red = self._is_red_hp_active and (current_hp_pct > 0.0) and (confirmed_curr_hp > 0)
             is_valid_scene = (time_since_seen <= 8.0)
             
             if is_alive_red and not self.is_paused and is_valid_scene:
@@ -228,7 +218,7 @@ class FusionEngine:
                 # 1. 심장박동 (Heartbeat): 잔여 체력(20% -> 1%)에 반비례하는 가변 BPM 펄스 진동 (66 ~ 158 BPM)
                 if d.heartbeat.intensity > 0:
                     red_max = max(2.0, self.config.red_hp_threshold)
-                    hp_ratio = max(0.0, min(1.0, (self.vision.current_hp_pct - 1.0) / (red_max - 1.0)))
+                    hp_ratio = max(0.0, min(1.0, (current_hp_pct - 1.0) / (red_max - 1.0)))
                     base_interval = 0.38 + (0.52 * hp_ratio)  # 1%일 때 0.38초(158 BPM) ~ 20%일 때 0.90초(66 BPM)
                     dur_scale = max(0.6, min(1.8, d.heartbeat.duration / 0.16))
                     hb_interval = max(0.35, base_interval * dur_scale)

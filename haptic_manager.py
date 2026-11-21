@@ -6,7 +6,7 @@ import queue
 from typing import Callable, Optional, List, Dict, Any, Tuple
 import numpy as np
 
-from config import HapticSinkConfig, DetailedHapticConfig, HapticDetailRow
+from config import HapticSinkConfig, DetailedHapticConfig, HapticDetailRow, classify_damage_tier
 
 try:
     import bhaptics_python
@@ -33,6 +33,10 @@ class HapticManager:
         self._is_running = False
         self._connected = False
         self._status_msg = "초기화 대기 중"
+        self._lifecycle_lock = threading.Lock()
+        self._reconnect_lock = threading.Lock()
+        self._pending_sink: Optional[HapticSinkConfig] = None
+        self._reconnect_thread: Optional[threading.Thread] = None
         
         # 큐 및 스레드
         self._send_queue: queue.Queue = queue.Queue(maxsize=100)
@@ -52,39 +56,81 @@ class HapticManager:
         self.on_status_change: Optional[Callable[[bool, str], None]] = None
         self.on_haptic_trigger: Optional[Callable[[str, int, int, List[int], List[int]], None]] = None
 
+    @staticmethod
+    def _drain_queue(q: queue.Queue) -> None:
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+
     def start(self) -> None:
         """햅틱 매니저 가동"""
-        if self._is_running:
-            return
-            
-        self._is_running = True
-        self._worker_thread = threading.Thread(target=self._run_official_sdk, daemon=True)
-        self._worker_thread.start()
-        
-        # 🚀 전용 버스트 워커 가동 (스레드 무한 생성 오버헤드 제거)
-        self._burst_worker_thread = threading.Thread(target=self._run_burst_worker, daemon=True)
-        self._burst_worker_thread.start()
+        with self._lifecycle_lock:
+            if self._is_running:
+                return
+
+            self._is_running = True
+            self._worker_thread = threading.Thread(target=self._run_official_sdk, daemon=True)
+            self._worker_thread.start()
+
+            # 🚀 전용 버스트 워커 가동 (스레드 무한 생성 오버헤드 제거)
+            self._burst_worker_thread = threading.Thread(target=self._run_burst_worker, daemon=True)
+            self._burst_worker_thread.start()
 
     def stop(self) -> None:
-        """햅틱 매니저 정지 및 리소스 정리"""
-        self._is_running = False
-        self._connected = False
-        
-        if HAS_BHAPTICS_SDK:
-            try:
-                bhaptics_python.stop_all()
-                bhaptics_python.close()
-            except Exception:
-                pass
-                
+        """햅틱 매니저 정지 및 리소스/스레드 안전 종료"""
+        with self._lifecycle_lock:
+            self._is_running = False
+            self._connected = False
+
+            cur_thread = threading.current_thread()
+            worker = self._worker_thread
+            burst_worker = self._burst_worker_thread
+
+            if worker and worker.is_alive() and worker is not cur_thread:
+                worker.join(timeout=1.5)
+            if burst_worker and burst_worker.is_alive() and burst_worker is not cur_thread:
+                burst_worker.join(timeout=1.5)
+
+            self._worker_thread = None
+            self._burst_worker_thread = None
+
+            self._drain_queue(self._send_queue)
+            self._drain_queue(self._burst_queue)
+
+            if HAS_BHAPTICS_SDK:
+                try:
+                    bhaptics_python.stop_all()
+                    bhaptics_python.close()
+                except Exception:
+                    pass
+
         self._notify_status(False, "햅틱 장치 연결 종료됨")
 
     def update_sink_config(self, new_sink: HapticSinkConfig) -> None:
-        """GUI에서 설정 변경 시 재연결"""
-        self.stop()
-        self.sink = new_sink
-        time.sleep(0.3)
-        self.start()
+        """GUI에서 설정 변경 시 UI 스레드를 블로킹하지 않고 비동기 안전 재연결"""
+        with self._reconnect_lock:
+            self._pending_sink = new_sink
+            if self._reconnect_thread and self._reconnect_thread.is_alive():
+                return
+            self._reconnect_thread = threading.Thread(target=self._reconnect_worker, daemon=True)
+            self._reconnect_thread.start()
+
+    def _reconnect_worker(self) -> None:
+        while True:
+            with self._reconnect_lock:
+                next_sink = self._pending_sink
+                self._pending_sink = None
+            if next_sink is None:
+                return
+            self.stop()
+            self.sink = next_sink
+            time.sleep(0.15)
+            self.start()
+            with self._reconnect_lock:
+                if self._pending_sink is None:
+                    return
 
     def is_connected(self) -> bool:
         return self._connected
@@ -170,6 +216,20 @@ class HapticManager:
         except queue.Full:
             pass
 
+    def _interruptible_sleep(self, duration: float, check_burst_queue: bool = True) -> bool:
+        """지정 시간 대기 중 종료 또는 후속 버스트 선점이 발생하면 즉시 True 반환"""
+        if duration <= 0.0:
+            return (not self._is_running) or (check_burst_queue and not self._burst_queue.empty())
+        end_time = time.monotonic() + duration
+        while self._is_running:
+            if check_burst_queue and not self._burst_queue.empty():
+                return True
+            remaining = end_time - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            time.sleep(min(0.025, remaining))
+        return True
+
     def _run_burst_worker(self) -> None:
         """백그라운드 전용 버스트 워커 루프"""
         while self._is_running:
@@ -188,6 +248,8 @@ class HapticManager:
         use_ripple = getattr(self.details, "enable_ripple_effect", True) and (level in ["medium", "heavy", "critical"])
 
         for burst_idx in range(hit_count):
+            if not self._is_running:
+                break
             if use_ripple:
                 self._exec_ripple_burst(level, intensity_val, duration_ms, position_mode)
             else:
@@ -220,10 +282,7 @@ class HapticManager:
 
             if burst_idx < hit_count - 1:
                 # 대기 중 새 타격(연속기 후속타 또는 기절)이 큐에 들어오면 잔여 반복을 즉시 중단하고 새 타격에 양보
-                if not self._burst_queue.empty():
-                    break
-                time.sleep((detail_row.duration * 0.7) + 0.05)
-                if not self._burst_queue.empty():
+                if self._interruptible_sleep((detail_row.duration * 0.7) + 0.05, check_burst_queue=True):
                     break
 
     def _exec_ripple_burst(self, level: str, intensity: int, duration_ms: int, position_mode: str = "All") -> None:
@@ -296,7 +355,9 @@ class HapticManager:
             rem_dur = max(150, duration_ms - 290)
             phases.append((p4_front, p4_back, rem_dur, 0.0))
 
-        for f20, b20, phase_dur, sleep_after in phases:
+        for idx, (f20, b20, phase_dur, sleep_after) in enumerate(phases):
+            if not self._is_running or (idx > 0 and not self._burst_queue.empty()):
+                break
             motors_sdk = self._create_sdk_motor_array(f20, b20)
             with self._state_lock:
                 self.last_front_motors = f20
@@ -321,26 +382,15 @@ class HapticManager:
                     pass
 
             if sleep_after > 0:
-                time.sleep(sleep_after)
+                if self._interruptible_sleep(sleep_after, check_burst_queue=True):
+                    break
 
     def trigger_damage_haptic(self, damage_percent: float, current_hp_pct: float = 100.0, position_mode: Optional[str] = None) -> None:
-        """감지된 데미지 % 및 남은 체력 %에 따른 햅틱 패턴 자동 분기 (각 행별 부위 적용)"""
-        d = self.details
-        if current_hp_pct <= 0.0:
-            pos = position_mode if position_mode is not None else d.faint.position
-            self.trigger_pattern_direct("faint", d.faint, pos)
-        elif damage_percent <= 20.0:
-            pos = position_mode if position_mode is not None else d.light.position
-            self.trigger_pattern_direct("light", d.light, pos)
-        elif damage_percent <= 50.0:
-            pos = position_mode if position_mode is not None else d.medium.position
-            self.trigger_pattern_direct("medium", d.medium, pos)
-        elif damage_percent <= 80.0:
-            pos = position_mode if position_mode is not None else d.heavy.position
-            self.trigger_pattern_direct("heavy", d.heavy, pos)
-        else:
-            pos = position_mode if position_mode is not None else d.critical.position
-            self.trigger_pattern_direct("critical", d.critical, pos)
+        """감지된 데미지 % 및 남은 체력 %에 따른 햅틱 패턴 자동 분기 (단일 표준 등급 분류 사용)"""
+        tier_key, _ = classify_damage_tier(damage_percent, current_hp_pct)
+        row = getattr(self.details, tier_key)
+        pos = position_mode if position_mode is not None else row.position
+        self.trigger_pattern_direct(tier_key, row, pos)
 
     def _generate_motor_matrix(self, level: str, intensity: int, position_mode: str = "All") -> Tuple[List[int], List[int]]:
         """패턴 레벨에 따른 20개 모터 강도 매핑"""
